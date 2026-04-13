@@ -149,6 +149,9 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
     user = update.message.from_user.first_name
 
+    # Debug log
+    logger.info(f"Received URL (first 200): {url[:200]}")
+    
     # Check if it looks like a Qwiklabs URL
     if "skills.google" not in url and "qwiklabs" not in url and "cloudshell" not in url:
         await update.message.reply_text(
@@ -166,6 +169,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Step 1: Extract token
     token = extract_token(url)
+    logger.info(f"Extracted token: {token}")
     if not token:
         await msg.edit_text(
             "❌ Could not extract token from your link.\n"
