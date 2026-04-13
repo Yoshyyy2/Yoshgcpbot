@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
 
 import logging
-import subprocess
+import asyncio
 import re
 import os
-import tempfile
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import unquote
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from playwright.async_api import async_playwright
 
 # ===== Config =====
 BOT_TOKEN = "8767032901:AAEG06KxLdAeVE7X1xm6pUTz8ezFdqqc1Ac"
 VLESS_UUID = "8024e6ab-5da4-473c-9008-2b3c51f8d697"
 REGION = "us-central1"
 SERVICE = "vless"
-IMAGE = "docker.io/yoshyyy/yoshvip:latest"
-PORT = 8080
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -23,153 +21,102 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ===== Extract token from Qwiklabs URL =====
-def extract_token(url: str):
-    try:
-        # First try raw URL
-        match = re.search(r'[&?]token=([A-Za-z0-9_\-]+)', url)
-        if match:
-            return match.group(1)
-        
-        # Try decoded URL
-        decoded = unquote(url)
-        match = re.search(r'[&?]token=([A-Za-z0-9_\-]+)', decoded)
-        if match:
-            return match.group(1)
-        
-        # Try double decoded
-        double_decoded = unquote(decoded)
-        match = re.search(r'[&?]token=([A-Za-z0-9_\-]+)', double_decoded)
-        if match:
-            return match.group(1)
-
-        # Try parse_qs on query string
-        parsed = urlparse(double_decoded)
-        params = parse_qs(parsed.query)
-        for key in ['token', 'access_token', 'auth_token']:
-            if key in params:
-                return params[key][0]
-
-        return None
-    except Exception as e:
-        logger.error(f"Token extraction error: {e}")
-        return None
-
-# ===== Activate GCP with access token =====
-def activate_gcp(token: str):
-    try:
-        # Set access token via environment
-        env = os.environ.copy()
-        env["CLOUDSDK_AUTH_ACCESS_TOKEN"] = token
-
-        # Try activate-access-token first
-        result = subprocess.run(
-            ["gcloud", "config", "set", "auth/access_token_file", "/dev/stdin"],
-            input=token,
-            capture_output=True, text=True, timeout=30, env=env
-        )
-
-        # Just set the token directly via gcloud auth
-        result2 = subprocess.run(
-            ["gcloud", "auth", "activate-service-account", "--access-token-file=/dev/stdin"],
-            input=token,
-            capture_output=True, text=True, timeout=30, env=env
-        )
-
-        # Store token for later use
-        os.environ["CLOUDSDK_AUTH_ACCESS_TOKEN"] = token
-        return True, None
-    except Exception as e:
-        return False, str(e)
-
-# ===== Get project from URL =====
+# ===== Extract project from URL =====
 def extract_project(url: str):
-    try:
-        # Try raw URL first - most reliable
-        match = re.search(r'(qwiklabs-gcp-[a-z0-9-]+)', url)
-        if match:
-            return match.group(1)
-        # Try decoded
-        decoded = unquote(url)
-        match = re.search(r'(qwiklabs-gcp-[a-z0-9-]+)', decoded)
-        if match:
-            return match.group(1)
-        return None
-    except Exception as e:
-        logger.error(f"Project extraction error: {e}")
-        return None
+    match = re.search(r'(qwiklabs-gcp-[a-z0-9-]+)', url)
+    return match.group(1) if match else None
 
-# ===== Get GCP Project =====
-def get_project(project_id=None):
-    try:
-        if project_id:
-            subprocess.run(
-                ["gcloud", "config", "set", "project", project_id],
-                capture_output=True, text=True, timeout=15,
-                env={**os.environ, "CLOUDSDK_AUTH_ACCESS_TOKEN": os.environ.get("CLOUDSDK_AUTH_ACCESS_TOKEN", "")}
+# ===== Deploy via Playwright =====
+async def deploy_via_browser(url: str, project: str, status_cb):
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+            ]
+        )
+        context = await browser.new_context(
+            viewport={"width": 1280, "height": 800},
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+        )
+        page = await context.new_page()
+
+        try:
+            # Step 1: Open Qwiklabs URL
+            await status_cb("🌐 Opening Qwiklabs link...")
+            await page.goto(url, wait_until="networkidle", timeout=60000)
+            await asyncio.sleep(3)
+
+            # Step 2: Wait for GCP Console to load
+            await status_cb("⏳ Waiting for GCP Console...")
+            await page.wait_for_url("**/console.cloud.google.com/**", timeout=60000)
+            await asyncio.sleep(5)
+            logger.info(f"Current URL: {page.url}")
+
+            # Step 3: Open Cloud Shell
+            await status_cb("🖥️ Opening Cloud Shell...")
+            # Click the Cloud Shell button (top right icon)
+            shell_btn = page.locator("button[aria-label='Activate Cloud Shell']")
+            if await shell_btn.count() == 0:
+                shell_btn = page.locator("[data-tooltip='Activate Cloud Shell']")
+            if await shell_btn.count() == 0:
+                shell_btn = page.locator("button.cloud-shell-button")
+            await shell_btn.click(timeout=30000)
+            await asyncio.sleep(8)
+
+            # Step 4: Wait for terminal
+            await status_cb("⌨️ Terminal ready, deploying...")
+            terminal = page.locator(".cloudshell-terminal textarea").first
+            if await terminal.count() == 0:
+                terminal = page.locator("textarea.xterm-helper-textarea").first
+            await terminal.wait_for(timeout=30000)
+            await asyncio.sleep(3)
+
+            # Step 5: Type deploy command
+            deploy_cmd = f"bash <(curl -fsSL https://raw.githubusercontent.com/Yoshyyy2/Mygcp/main/yosh.sh)"
+            await terminal.click()
+            await asyncio.sleep(1)
+
+            # Type command with auto answers
+            full_cmd = (
+                f"printf '1\\n1\\n1\\n512Mi\\n{SERVICE}\\n' | "
+                f"bash <(curl -fsSL https://raw.githubusercontent.com/Yoshyyy2/Mygcp/main/yosh.sh)"
             )
-            return project_id
-        result = subprocess.run(
-            ["gcloud", "config", "get-value", "project"],
-            capture_output=True, text=True, timeout=15
-        )
-        return result.stdout.strip()
-    except:
-        return None
+            await page.keyboard.type(full_cmd)
+            await page.keyboard.press("Enter")
 
-# ===== Get Project Number =====
-def get_project_number(project: str):
-    try:
-        result = subprocess.run(
-            ["gcloud", "projects", "describe", project, "--format=value(projectNumber)"],
-            capture_output=True, text=True, timeout=15
-        )
-        return result.stdout.strip()
-    except:
-        return None
+            await status_cb("🚀 Deploying... (this takes ~3 minutes)")
 
-# ===== Enable APIs =====
-def enable_apis():
-    try:
-        result = subprocess.run(
-            ["gcloud", "services", "enable", 
-             "run.googleapis.com", 
-             "cloudbuild.googleapis.com", 
-             "--quiet"],
-            capture_output=True, text=True, timeout=60
-        )
-        return result.returncode == 0
-    except:
-        return False
+            # Step 6: Wait for output and grab vless link
+            await asyncio.sleep(180)  # Wait 3 minutes for deploy
 
-# ===== Deploy Cloud Run =====
-def deploy_cloudrun():
-    try:
-        env = {**os.environ}
-        result = subprocess.run([
-            "gcloud", "run", "deploy", SERVICE,
-            f"--image={IMAGE}",
-            "--platform=managed",
-            f"--region={REGION}",
-            "--memory=512Mi",
-            "--cpu=1",
-            "--timeout=3600",
-            "--allow-unauthenticated",
-            f"--port={PORT}",
-            "--min-instances=1",
-            "--quiet"
-        ], capture_output=True, text=True, timeout=300, env=env)
-        return result.returncode == 0, result.stderr
-    except Exception as e:
-        return False, str(e)
+            # Take screenshot for debugging
+            await page.screenshot(path="/tmp/deploy_result.png")
 
-# ===== Build VLESS URI =====
-def build_uri(host: str):
-    return (
-        f"vless://{VLESS_UUID}@vpn.googleapis.com:443"
-        f"?path=%2Fvless_yosh&security=tls&encryption=none"
-        f"&host={host}&type=ws#Yosh-VLESS-WS"
-    )
+            # Get terminal output
+            terminal_text = await page.locator(".cloudshell-terminal").inner_text()
+            logger.info(f"Terminal output: {terminal_text[-500:]}")
+
+            # Extract vless link
+            vless_match = re.search(r'vless://[^\s]+', terminal_text)
+            if vless_match:
+                return True, vless_match.group(0)
+
+            # Try trojan too
+            trojan_match = re.search(r'trojan://[^\s]+', terminal_text)
+            if trojan_match:
+                return True, trojan_match.group(0)
+
+            return False, "Could not extract access key from output"
+
+        except Exception as e:
+            logger.error(f"Browser error: {e}")
+            await page.screenshot(path="/tmp/error_screenshot.png")
+            return False, str(e)
+        finally:
+            await browser.close()
 
 # ===== /start command =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -178,119 +125,65 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Send me your *Qwiklabs SSO link* and I'll deploy your VLESS node automatically!\n\n"
         "📌 The link looks like:\n"
         "`https://www.skills.google/google_sso?...`\n\n"
-        "Just paste it here and wait! 🚀",
+        "⏱ Deploy takes about *3 minutes*. Just paste and wait! 🚀",
         parse_mode="Markdown"
     )
 
-# ===== Handle Qwiklabs URL =====
+# ===== Handle URL =====
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
     user = update.message.from_user.first_name
 
-    # Debug log
-    logger.info(f"Received URL (first 200): {url[:200]}")
-    
-    # Check if it looks like a Qwiklabs URL
-    if "skills.google" not in url and "qwiklabs" not in url and "cloudshell" not in url:
+    if "skills.google" not in url and "qwiklabs" not in url:
         await update.message.reply_text(
-            "❌ That doesn't look like a Qwiklabs link bro!\n\n"
+            "❌ That doesn't look like a Qwiklabs link!\n\n"
             "Send the link that starts with:\n"
             "`https://www.skills.google/google_sso?...`",
             parse_mode="Markdown"
         )
         return
 
-    msg = await update.message.reply_text(
-        f"⚡ Got it {user}! Starting deployment...\n\n"
-        "⠋ Extracting credentials..."
-    )
-
-    # Step 1: Extract token
-    token = extract_token(url)
-    logger.info(f"Extracted token: {token}")
-    if not token:
-        await msg.edit_text(
-            "❌ Could not extract token from your link.\n"
-            "Make sure you send the full Qwiklabs SSO URL!"
-        )
-        return
-
-    await msg.edit_text(
-        "✓ Credentials extracted\n"
-        "⠙ Authenticating with GCP..."
-    )
-
-    # Extract project from URL
-    project_id = extract_project(url)
-    logger.info(f"Extracted project: {project_id}")
-
-    # Step 2: Activate GCP
-    ok, err = activate_gcp(token)
-    if not ok:
-        await msg.edit_text(
-            f"❌ GCP authentication failed!\n\n"
-            f"Error: `{err[:200]}`",
-            parse_mode="Markdown"
-        )
-        return
-
-    await msg.edit_text(
-        "✓ Credentials extracted\n"
-        "✓ GCP authenticated\n"
-        "⠹ Getting project info..."
-    )
-
-    # Step 3: Get project
-    project = get_project(project_id)
+    project = extract_project(url)
     if not project:
-        await msg.edit_text("❌ Could not get GCP project ID!")
+        await update.message.reply_text("❌ Could not find project ID in the link!")
         return
 
-    project_number = get_project_number(project)
-
-    await msg.edit_text(
-        "✓ Credentials extracted\n"
-        "✓ GCP authenticated\n"
-        f"✓ Project: `{project}`\n"
-        "⠸ Enabling APIs...",
+    msg = await update.message.reply_text(
+        f"⚡ Got it {user}!\n"
+        f"📋 Project: `{project}`\n\n"
+        f"🌐 Opening Qwiklabs link...",
         parse_mode="Markdown"
     )
 
-    # Step 4: Enable APIs
-    enable_apis()
+    async def status_cb(text):
+        try:
+            await msg.edit_text(
+                f"📋 Project: `{project}`\n\n{text}",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
 
-    await msg.edit_text(
-        "✓ Credentials extracted\n"
-        "✓ GCP authenticated\n"
-        f"✓ Project: `{project}`\n"
-        "✓ APIs enabled\n"
-        "⠼ Deploying to Cloud Run...",
-        parse_mode="Markdown"
-    )
-
-    # Step 5: Deploy
-    ok, err = deploy_cloudrun()
-    if not ok:
-        await msg.edit_text(
-            f"❌ Deployment failed!\n\n`{err[:300]}`",
-            parse_mode="Markdown"
-        )
-        return
-
-    # Step 6: Build URI
-    host = f"{SERVICE}-{project_number}.{REGION}.run.app"
-    uri = build_uri(host)
-
-    await msg.edit_text(
-        f"✅ *Deploy Successful!*\n\n"
-        f"☁️ Project: `{project}`\n"
-        f"🌍 Region: `{REGION}`\n"
-        f"🔌 Protocol: `VLESS WS`\n"
-        f"🔗 URL: `https://{host}`\n\n"
-        f"🔑 *Access Key:*\n"
-        f"`{uri}`",
-        parse_mode="Markdown"
-    )
+    try:
+        ok, result = await deploy_via_browser(url, project, status_cb)
+        if ok:
+            host = f"{SERVICE}-{project}.{REGION}.run.app"
+            await msg.edit_text(
+                f"✅ *Deploy Successful!*\n\n"
+                f"📋 Project: `{project}`\n"
+                f"🌍 Region: `{REGION}`\n"
+                f"🔌 Protocol: `VLESS WS`\n\n"
+                f"🔑 *Access Key:*\n"
+                f"`{result}`",
+                parse_mode="Markdown"
+            )
+        else:
+            await msg.edit_text(
+                f"❌ Deploy failed!\n\n`{result[:300]}`",
+                parse_mode="Markdown"
+            )
+    except Exception as e:
+        await msg.edit_text(f"❌ Error: `{str(e)[:200]}`", parse_mode="Markdown")
 
 # ===== Main =====
 def main():
