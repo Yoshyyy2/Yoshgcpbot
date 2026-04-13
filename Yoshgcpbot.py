@@ -10,7 +10,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # ===== Config =====
-BOT_TOKEN = "8767032901:AAEG06KxLdAeVE7X1xm6pUTz8ezFdqqc1Ac"
+BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
 VLESS_UUID = "8024e6ab-5da4-473c-9008-2b3c51f8d697"
 REGION = "us-central1"
 SERVICE = "vless"
@@ -26,22 +26,30 @@ logger = logging.getLogger(__name__)
 # ===== Extract token from Qwiklabs URL =====
 def extract_token(url: str):
     try:
-        # Decode URL if needed
+        # First try raw URL
+        match = re.search(r'[&?]token=([A-Za-z0-9_\-]+)', url)
+        if match:
+            return match.group(1)
+        
+        # Try decoded URL
         decoded = unquote(url)
-        # Try to find token param
-        parsed = urlparse(decoded)
-        params = parse_qs(parsed.query)
-        
-        # Check common token param names
-        for key in ['token', 'access_token', 'auth_token']:
-            if key in params:
-                return params[key][0]
-        
-        # Some URLs have token at the end after '&token='
         match = re.search(r'[&?]token=([A-Za-z0-9_\-]+)', decoded)
         if match:
             return match.group(1)
-            
+        
+        # Try double decoded
+        double_decoded = unquote(decoded)
+        match = re.search(r'[&?]token=([A-Za-z0-9_\-]+)', double_decoded)
+        if match:
+            return match.group(1)
+
+        # Try parse_qs on query string
+        parsed = urlparse(double_decoded)
+        params = parse_qs(parsed.query)
+        for key in ['token', 'access_token', 'auth_token']:
+            if key in params:
+                return params[key][0]
+
         return None
     except Exception as e:
         logger.error(f"Token extraction error: {e}")
