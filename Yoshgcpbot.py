@@ -37,10 +37,15 @@ async def deploy_via_browser(url: str, project: str, status_cb):
                 "--disable-dev-shm-usage",
             ]
         )
+        # Use fresh incognito context - no saved cookies!
         context = await browser.new_context(
             viewport={"width": 1280, "height": 800},
-            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+            storage_state=None,  # No saved state
+            no_viewport=False,
         )
+        # Clear all cookies and storage to simulate private/incognito
+        await context.clear_cookies()
         page = await context.new_page()
 
         try:
