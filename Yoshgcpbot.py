@@ -4,16 +4,21 @@ import logging
 import asyncio
 import re
 import os
+import json
+import subprocess
+import tempfile
 from urllib.parse import unquote
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from playwright.async_api import async_playwright
+import httpx
 
 # ===== Config =====
 BOT_TOKEN = "8767032901:AAEG06KxLdAeVE7X1xm6pUTz8ezFdqqc1Ac"
 VLESS_UUID = "8024e6ab-5da4-473c-9008-2b3c51f8d697"
 REGION = "us-central1"
 SERVICE = "vless"
+IMAGE = "docker.io/yoshyyy/yoshvip:latest"
+PORT = 8080
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -21,116 +26,192 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ===== Extract project from URL =====
+# ===== Extract from URL =====
+def extract_token(url: str):
+    match = re.search(r'[&?]token=([A-Za-z0-9_\-]+)', url)
+    return match.group(1) if match else None
+
 def extract_project(url: str):
     match = re.search(r'(qwiklabs-gcp-[a-z0-9-]+)', url)
     return match.group(1) if match else None
 
-# ===== Deploy via Playwright =====
-async def deploy_via_browser(url: str, project: str, status_cb):
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-            ]
-        )
-        # Use fresh incognito context - no saved cookies!
-        context = await browser.new_context(
-            viewport={"width": 1280, "height": 800},
-            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-            storage_state=None,  # No saved state
-            no_viewport=False,
-        )
-        # Clear all cookies and storage to simulate private/incognito
-        await context.clear_cookies()
-        page = await context.new_page()
+def extract_email(url: str):
+    decoded = unquote(unquote(url))
+    match = re.search(r'Email[=%]3D([^&%\s]+)', decoded)
+    if match:
+        return unquote(match.group(1))
+    match = re.search(r'student-\d+-[a-z0-9]+@qwiklabs\.net', decoded)
+    return match.group(0) if match else None
 
-        try:
-            # Step 1: Open Qwiklabs URL
-            await status_cb("🌐 Opening Qwiklabs link...")
-            await page.goto(url, wait_until="networkidle", timeout=60000)
-            await asyncio.sleep(3)
-
-            # Step 2: Wait for GCP Console to load
-            await status_cb("⏳ Waiting for GCP Console...")
-            await page.wait_for_url("**/console.cloud.google.com/**", timeout=60000)
-            await asyncio.sleep(5)
-            logger.info(f"Current URL: {page.url}")
-
-            # Step 3: Open Cloud Shell
-            await status_cb("🖥️ Opening Cloud Shell...")
-            # Click the Cloud Shell button (top right icon)
-            shell_btn = page.locator("button[aria-label='Activate Cloud Shell']")
-            if await shell_btn.count() == 0:
-                shell_btn = page.locator("[data-tooltip='Activate Cloud Shell']")
-            if await shell_btn.count() == 0:
-                shell_btn = page.locator("button.cloud-shell-button")
-            await shell_btn.click(timeout=30000)
-            await asyncio.sleep(8)
-
-            # Step 4: Wait for terminal
-            await status_cb("⌨️ Terminal ready, deploying...")
-            terminal = page.locator(".cloudshell-terminal textarea").first
-            if await terminal.count() == 0:
-                terminal = page.locator("textarea.xterm-helper-textarea").first
-            await terminal.wait_for(timeout=30000)
-            await asyncio.sleep(3)
-
-            # Step 5: Type deploy command
-            deploy_cmd = f"bash <(curl -fsSL https://raw.githubusercontent.com/Yoshyyy2/Mygcp/main/yosh.sh)"
-            await terminal.click()
-            await asyncio.sleep(1)
-
-            # Type command with auto answers
-            full_cmd = (
-                f"printf '1\\n1\\n1\\n512Mi\\n{SERVICE}\\n' | "
-                f"bash <(curl -fsSL https://raw.githubusercontent.com/Yoshyyy2/Mygcp/main/yosh.sh)"
+# ===== Exchange Qwiklabs token for Google access token =====
+async def get_google_token(qwiklabs_token: str, email: str):
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            # Try to exchange via Google OAuth
+            resp = await client.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+                    "subject_token": qwiklabs_token,
+                    "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+                    "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
+                }
             )
-            await page.keyboard.type(full_cmd)
-            await page.keyboard.press("Enter")
+            logger.info(f"Token exchange response: {resp.status_code} {resp.text[:200]}")
+            if resp.status_code == 200:
+                return resp.json().get("access_token")
+    except Exception as e:
+        logger.error(f"Token exchange error: {e}")
 
-            await status_cb("🚀 Deploying... (this takes ~3 minutes)")
+    # Try using token directly as bearer
+    return qwiklabs_token
 
-            # Step 6: Wait for output and grab vless link
-            await asyncio.sleep(180)  # Wait 3 minutes for deploy
+# ===== Enable APIs via REST =====
+async def enable_apis_rest(access_token: str, project: str):
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            headers = {"Authorization": f"Bearer {access_token}"}
+            for api in ["run.googleapis.com", "cloudbuild.googleapis.com"]:
+                resp = await client.post(
+                    f"https://serviceusage.googleapis.com/v1/projects/{project}/services/{api}:enable",
+                    headers=headers,
+                    json={}
+                )
+                logger.info(f"Enable {api}: {resp.status_code}")
+        return True
+    except Exception as e:
+        logger.error(f"Enable APIs error: {e}")
+        return False
 
-            # Take screenshot for debugging
-            await page.screenshot(path="/tmp/deploy_result.png")
+# ===== Deploy via Cloud Run REST API =====
+async def deploy_cloudrun_rest(access_token: str, project: str):
+    try:
+        async with httpx.AsyncClient(timeout=300) as client:
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json"
+            }
+            
+            # Get project number
+            resp = await client.get(
+                f"https://cloudresourcemanager.googleapis.com/v1/projects/{project}",
+                headers=headers
+            )
+            logger.info(f"Get project: {resp.status_code} {resp.text[:200]}")
+            if resp.status_code != 200:
+                return False, f"Cannot access project: {resp.text[:200]}"
+            
+            project_number = resp.json().get("projectNumber")
+            logger.info(f"Project number: {project_number}")
 
-            # Get terminal output
-            terminal_text = await page.locator(".cloudshell-terminal").inner_text()
-            logger.info(f"Terminal output: {terminal_text[-500:]}")
+            # Deploy Cloud Run service
+            service_url = f"https://run.googleapis.com/v1/namespaces/{project}/services"
+            body = {
+                "apiVersion": "serving.knative.dev/v1",
+                "kind": "Service",
+                "metadata": {
+                    "name": SERVICE,
+                    "namespace": project,
+                    "annotations": {
+                        "run.googleapis.com/ingress": "all",
+                        "run.googleapis.com/launch-stage": "BETA"
+                    }
+                },
+                "spec": {
+                    "template": {
+                        "metadata": {
+                            "annotations": {
+                                "autoscaling.knative.dev/minScale": "1",
+                                "run.googleapis.com/cpu-throttling": "false"
+                            }
+                        },
+                        "spec": {
+                            "containerConcurrency": 1000,
+                            "timeoutSeconds": 3600,
+                            "containers": [{
+                                "image": IMAGE,
+                                "ports": [{"containerPort": PORT}],
+                                "resources": {
+                                    "limits": {
+                                        "cpu": "1",
+                                        "memory": "512Mi"
+                                    }
+                                }
+                            }]
+                        }
+                    }
+                }
+            }
 
-            # Extract vless link
-            vless_match = re.search(r'vless://[^\s]+', terminal_text)
-            if vless_match:
-                return True, vless_match.group(0)
+            # Try create first, then update if exists
+            resp = await client.post(
+                f"https://{REGION}-run.googleapis.com/apis/serving.knative.dev/v1/namespaces/{project}/services",
+                headers=headers,
+                json=body
+            )
+            logger.info(f"Deploy response: {resp.status_code} {resp.text[:300]}")
 
-            # Try trojan too
-            trojan_match = re.search(r'trojan://[^\s]+', terminal_text)
-            if trojan_match:
-                return True, trojan_match.group(0)
+            if resp.status_code in [200, 201]:
+                host = f"{SERVICE}-{project_number}.{REGION}.run.app"
+                return True, host
+            elif resp.status_code == 409:
+                # Service exists, update it
+                resp2 = await client.put(
+                    f"https://{REGION}-run.googleapis.com/apis/serving.knative.dev/v1/namespaces/{project}/services/{SERVICE}",
+                    headers=headers,
+                    json=body
+                )
+                logger.info(f"Update response: {resp2.status_code} {resp2.text[:300]}")
+                if resp2.status_code in [200, 201]:
+                    host = f"{SERVICE}-{project_number}.{REGION}.run.app"
+                    return True, host
 
-            return False, "Could not extract access key from output"
+            return False, f"Deploy failed: {resp.text[:300]}"
 
-        except Exception as e:
-            logger.error(f"Browser error: {e}")
-            await page.screenshot(path="/tmp/error_screenshot.png")
-            return False, str(e)
-        finally:
-            await browser.close()
+    except Exception as e:
+        logger.error(f"Deploy error: {e}")
+        return False, str(e)
 
-# ===== /start command =====
+# ===== Allow unauthenticated =====
+async def allow_unauthenticated(access_token: str, project: str):
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json"
+            }
+            resp = await client.post(
+                f"https://{REGION}-run.googleapis.com/v1/projects/{project}/locations/{REGION}/services/{SERVICE}:setIamPolicy",
+                headers=headers,
+                json={
+                    "policy": {
+                        "bindings": [{
+                            "role": "roles/run.invoker",
+                            "members": ["allUsers"]
+                        }]
+                    }
+                }
+            )
+            logger.info(f"IAM policy: {resp.status_code}")
+    except Exception as e:
+        logger.error(f"IAM error: {e}")
+
+# ===== Build URI =====
+def build_uri(host: str):
+    return (
+        f"vless://{VLESS_UUID}@vpn.googleapis.com:443"
+        f"?path=%2Fvless_yosh&security=tls&encryption=none"
+        f"&host={host}&type=ws#Yosh-VLESS-WS"
+    )
+
+# ===== /start =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🌐 *Yosh VIP — GCP Deploy Bot*\n\n"
         "Send me your *Qwiklabs SSO link* and I'll deploy your VLESS node automatically!\n\n"
         "📌 The link looks like:\n"
         "`https://www.skills.google/google_sso?...`\n\n"
-        "⏱ Deploy takes about *3 minutes*. Just paste and wait! 🚀",
+        "⏱ Deploy takes about *2 minutes*. Just paste and wait! 🚀",
         parse_mode="Markdown"
     )
 
@@ -148,38 +229,68 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    token = extract_token(url)
     project = extract_project(url)
+    email = extract_email(url)
+
+    logger.info(f"Token: {token[:20] if token else None}")
+    logger.info(f"Project: {project}")
+    logger.info(f"Email: {email}")
+
     if not project:
         await update.message.reply_text("❌ Could not find project ID in the link!")
+        return
+
+    if not token:
+        await update.message.reply_text("❌ Could not extract token from the link!")
         return
 
     msg = await update.message.reply_text(
         f"⚡ Got it {user}!\n"
         f"📋 Project: `{project}`\n\n"
-        f"🌐 Opening Qwiklabs link...",
+        f"🔐 Authenticating with GCP...",
         parse_mode="Markdown"
     )
 
-    async def status_cb(text):
-        try:
-            await msg.edit_text(
-                f"📋 Project: `{project}`\n\n{text}",
-                parse_mode="Markdown"
-            )
-        except Exception:
-            pass
-
     try:
-        ok, result = await deploy_via_browser(url, project, status_cb)
+        # Get access token
+        access_token = await get_google_token(token, email)
+        logger.info(f"Access token: {access_token[:20] if access_token else None}")
+
+        await msg.edit_text(
+            f"📋 Project: `{project}`\n\n"
+            f"✓ Token acquired\n"
+            f"🔧 Enabling APIs...",
+            parse_mode="Markdown"
+        )
+
+        # Enable APIs
+        await enable_apis_rest(access_token, project)
+
+        await msg.edit_text(
+            f"📋 Project: `{project}`\n\n"
+            f"✓ Token acquired\n"
+            f"✓ APIs enabled\n"
+            f"🚀 Deploying Cloud Run...",
+            parse_mode="Markdown"
+        )
+
+        # Deploy
+        ok, result = await deploy_cloudrun_rest(access_token, project)
+
         if ok:
-            host = f"{SERVICE}-{project}.{REGION}.run.app"
+            host = result
+            # Allow unauthenticated access
+            await allow_unauthenticated(access_token, project)
+            uri = build_uri(host)
             await msg.edit_text(
                 f"✅ *Deploy Successful!*\n\n"
                 f"📋 Project: `{project}`\n"
                 f"🌍 Region: `{REGION}`\n"
-                f"🔌 Protocol: `VLESS WS`\n\n"
+                f"🔌 Protocol: `VLESS WS`\n"
+                f"🔗 URL: `https://{host}`\n\n"
                 f"🔑 *Access Key:*\n"
-                f"`{result}`",
+                f"`{uri}`",
                 parse_mode="Markdown"
             )
         else:
@@ -188,6 +299,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
     except Exception as e:
+        logger.error(f"Error: {e}")
         await msg.edit_text(f"❌ Error: `{str(e)[:200]}`", parse_mode="Markdown")
 
 # ===== Main =====
