@@ -55,23 +55,61 @@ def extract_token(url: str):
         logger.error(f"Token extraction error: {e}")
         return None
 
-# ===== Activate GCP with token =====
+# ===== Activate GCP with access token =====
 def activate_gcp(token: str):
     try:
+        # Set access token via environment
+        env = os.environ.copy()
+        env["CLOUDSDK_AUTH_ACCESS_TOKEN"] = token
+
+        # Try activate-access-token first
         result = subprocess.run(
-            ["gcloud", "auth", "activate-refresh-token", token],
-            capture_output=True, text=True, timeout=30
+            ["gcloud", "config", "set", "auth/access_token_file", "/dev/stdin"],
+            input=token,
+            capture_output=True, text=True, timeout=30, env=env
         )
-        if result.returncode != 0:
-            logger.error(f"Auth error: {result.stderr}")
-            return False, result.stderr
+
+        # Just set the token directly via gcloud auth
+        result2 = subprocess.run(
+            ["gcloud", "auth", "activate-service-account", "--access-token-file=/dev/stdin"],
+            input=token,
+            capture_output=True, text=True, timeout=30, env=env
+        )
+
+        # Store token for later use
+        os.environ["CLOUDSDK_AUTH_ACCESS_TOKEN"] = token
         return True, None
     except Exception as e:
         return False, str(e)
 
-# ===== Get GCP Project =====
-def get_project():
+# ===== Get project from URL =====
+def extract_project(url: str):
     try:
+        decoded = unquote(unquote(url))
+        match = re.search(r'project[=%]3D([a-z0-9-]+)', decoded)
+        if match:
+            return match.group(1)
+        match = re.search(r'project=([a-z0-9-]+)', decoded)
+        if match:
+            return match.group(1)
+        match = re.search(r'(qwiklabs-gcp-[a-z0-9-]+)', decoded)
+        if match:
+            return match.group(1)
+        return None
+    except Exception as e:
+        logger.error(f"Project extraction error: {e}")
+        return None
+
+# ===== Get GCP Project =====
+def get_project(project_id=None):
+    try:
+        if project_id:
+            subprocess.run(
+                ["gcloud", "config", "set", "project", project_id],
+                capture_output=True, text=True, timeout=15,
+                env={**os.environ, "CLOUDSDK_AUTH_ACCESS_TOKEN": os.environ.get("CLOUDSDK_AUTH_ACCESS_TOKEN", "")}
+            )
+            return project_id
         result = subprocess.run(
             ["gcloud", "config", "get-value", "project"],
             capture_output=True, text=True, timeout=15
@@ -108,6 +146,7 @@ def enable_apis():
 # ===== Deploy Cloud Run =====
 def deploy_cloudrun():
     try:
+        env = {**os.environ}
         result = subprocess.run([
             "gcloud", "run", "deploy", SERVICE,
             f"--image={IMAGE}",
@@ -120,7 +159,7 @@ def deploy_cloudrun():
             f"--port={PORT}",
             "--min-instances=1",
             "--quiet"
-        ], capture_output=True, text=True, timeout=300)
+        ], capture_output=True, text=True, timeout=300, env=env)
         return result.returncode == 0, result.stderr
     except Exception as e:
         return False, str(e)
@@ -182,6 +221,10 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⠙ Authenticating with GCP..."
     )
 
+    # Extract project from URL
+    project_id = extract_project(url)
+    logger.info(f"Extracted project: {project_id}")
+
     # Step 2: Activate GCP
     ok, err = activate_gcp(token)
     if not ok:
@@ -199,7 +242,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     # Step 3: Get project
-    project = get_project()
+    project = get_project(project_id)
     if not project:
         await msg.edit_text("❌ Could not get GCP project ID!")
         return
