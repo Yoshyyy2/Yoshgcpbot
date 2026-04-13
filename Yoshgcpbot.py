@@ -85,13 +85,12 @@ def activate_gcp(token: str):
 # ===== Get project from URL =====
 def extract_project(url: str):
     try:
-        decoded = unquote(unquote(url))
-        match = re.search(r'project[=%]3D([a-z0-9-]+)', decoded)
+        # Try raw URL first - most reliable
+        match = re.search(r'(qwiklabs-gcp-[a-z0-9-]+)', url)
         if match:
             return match.group(1)
-        match = re.search(r'project=([a-z0-9-]+)', decoded)
-        if match:
-            return match.group(1)
+        # Try decoded
+        decoded = unquote(url)
         match = re.search(r'(qwiklabs-gcp-[a-z0-9-]+)', decoded)
         if match:
             return match.group(1)
